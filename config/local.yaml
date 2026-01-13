@@ -1,0 +1,25 @@
+env: "local" # local, dev, prod
+postgres:
+  host: "localhost"
+  port: 5432
+  user: "postgres"
+  password: "postgres"
+
+  dbname: "postgres"
+  sslmode: "disable"
+
+redis:
+  host: "localhost"
+  port: 6379
+  password: ""
+  db: 0
+  ttl: 300s
+
+http_server:
+  address: "localhost:8080"
+  timeout: 4s
+  iddle_timeout: 60s
+
+jwt:
+  secret: "owl_house"
+  ttl: 15m
