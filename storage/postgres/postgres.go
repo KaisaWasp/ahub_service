@@ -8,11 +8,13 @@ import (
 	"log/slog"
 	"time"
 
-	_ "github.com/jackc/pgx/v5/stdlib"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
 type Storage struct {
-	db  *sql.DB
+	db  *gorm.DB
 	log *slog.Logger
 }
 
@@ -28,6 +30,29 @@ type UserInfo struct {
 	PasswordHash string
 }
 
+type RefreshToken struct {
+	Token     string    `gorm:"primaryKey;column:token"`
+	UserID    string    `gorm:"column:user_id;not null"`
+	ExpiresAt time.Time `gorm:"column:expires_at;not null"`
+}
+
+func (RefreshToken) TableName() string {
+	return "refresh_tokens"
+}
+
+type User struct {
+	ID           string  `gorm:"column:id;primaryKey"`
+	FirstName    string  `gorm:"column:first_name;not null"`
+	LastName     string  `gorm:"column:last_name;not null"`
+	Email        *string `gorm:"column:email"`
+	Phone        *string `gorm:"column:phone"`
+	PasswordHash string  `gorm:"column:password_hash;not null"`
+}
+
+func (User) TableName() string {
+	return "users"
+}
+
 func New(cfg config.PostgresConfig, log *slog.Logger) (*Storage, error) {
 	op := "storage.postgres.New"
 
@@ -41,24 +66,21 @@ func New(cfg config.PostgresConfig, log *slog.Logger) (*Storage, error) {
 		cfg.SSLMode,
 	)
 
-	fmt.Println("Postgres DSN:", dsn)
-
-	db, err := sql.Open("pgx", dsn)
+	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("%s: open db: %w", op, err)
 	}
 
-	db.SetMaxOpenConns(25)
-	db.SetMaxIdleConns(25)
-	db.SetConnMaxLifetime(5 * time.Minute)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	if err := db.PingContext(ctx); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("%s: ping db: %w", op, err)
+	sqlDB, err := db.DB()
+	if err != nil {
+		return nil, fmt.Errorf("%s: get sql db: %w", op, err)
 	}
+
+	sqlDB.SetMaxOpenConns(25)
+	sqlDB.SetMaxIdleConns(25)
+	sqlDB.SetConnMaxLifetime(5 * time.Minute)
 
 	log.Info("postgres connected")
 
@@ -75,84 +97,96 @@ func (s *Storage) SaveRefreshToken(
 	expiresAt time.Time,
 ) error {
 
-	query := `
-		INSERT INTO refresh_tokens (token, user_id, expires_at)
-		VALUES ($1, $2, $3)
-	`
+	rt := RefreshToken{
+		Token:     token,
+		UserID:    userID,
+		ExpiresAt: expiresAt,
+	}
 
-	_, err := s.db.ExecContext(ctx, query, token, userID, expiresAt)
-	if err != nil {
+	if err := s.db.WithContext(ctx).Create(&rt).Error; err != nil {
 		return fmt.Errorf("save refresh token: %w", err)
 	}
 
 	return nil
 }
 
-func (s *Storage) GetRefreshToken(ctx context.Context, token string) (*RefreshTokenData, error) {
-	query := `
-		SELECT user_id, expires_at
-		FROM refresh_tokens
-		WHERE token = $1
-	`
+func (s *Storage) GetRefreshToken(
+	ctx context.Context,
+	token string,
+) (*RefreshTokenData, error) {
 
-	var userID string
-	var expiresAt time.Time
+	var rt RefreshToken
 
-	err := s.db.QueryRowContext(ctx, query, token).Scan(&userID, &expiresAt)
+	err := s.db.WithContext(ctx).
+		Where("token = ?", token).
+		First(&rt).Error
+
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if err == gorm.ErrRecordNotFound {
 			return nil, fmt.Errorf("refresh token not found")
 		}
 		return nil, fmt.Errorf("get refresh token: %w", err)
 	}
 
 	return &RefreshTokenData{
-		UserID:    userID,
-		ExpiresAt: expiresAt,
+		UserID:    rt.UserID,
+		ExpiresAt: rt.ExpiresAt,
 	}, nil
 }
 
-func (s *Storage) GetUserByLogin(ctx context.Context, login string) (*UserInfo, error) {
-	const query = `
-		SELECT id, email, phone, password_hash
-		FROM users
-		WHERE email = $1 OR phone = $1
-		LIMIT 1
-	`
+func (s *Storage) GetUserByLogin(
+	ctx context.Context,
+	login string,
+) (*UserInfo, error) {
 
-	var user UserInfo
+	var user User
 
-	err := s.db.QueryRowContext(ctx, query, login).Scan(
-		&user.ID,
-		&user.Email,
-		&user.Phone,
-		&user.PasswordHash,
-	)
+	err := s.db.WithContext(ctx).
+		Where("email = ? OR phone = ?", login, login).
+		Limit(1).
+		First(&user).Error
+
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if err == gorm.ErrRecordNotFound {
 			return nil, fmt.Errorf("user not found")
 		}
 		return nil, fmt.Errorf("get user by login: %w", err)
 	}
 
-	return &user, nil
+	return &UserInfo{
+		ID:           user.ID,
+		Email:        toNullString(user.Email),
+		Phone:        toNullString(user.Phone),
+		PasswordHash: user.PasswordHash,
+	}, nil
 }
 
-func (s *Storage) DeleteRefreshToken(ctx context.Context, token string) error {
-	query := `
-		DELETE FROM refresh_tokens
-		WHERE token = $1
-	`
+func (s *Storage) DeleteRefreshToken(
+	ctx context.Context,
+	token string,
+) error {
 
-	result, err := s.db.ExecContext(ctx, query, token)
-	if err != nil {
-		return fmt.Errorf("delete refresh token: %w", err)
+	result := s.db.WithContext(ctx).
+		Where("token = ?", token).
+		Delete(&RefreshToken{})
+
+	if result.Error != nil {
+		return fmt.Errorf("delete refresh token: %w", result.Error)
 	}
 
-	rows, _ := result.RowsAffected()
-	if rows == 0 {
+	if result.RowsAffected == 0 {
 		return fmt.Errorf("refresh token not found")
 	}
 
 	return nil
+}
+
+func toNullString(s *string) sql.NullString {
+	if s == nil {
+		return sql.NullString{}
+	}
+	return sql.NullString{
+		String: *s,
+		Valid:  true,
+	}
 }

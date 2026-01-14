@@ -24,7 +24,7 @@ func main() {
 
 	log.Info("start", slog.String("env", cfg.Env))
 
-	migrationsPath := "file://D:/MyProjects/AHUB/migrations"
+	migrationsPath := "../../migrations"
 	pg := cfg.Postgres
 	dbURL := fmt.Sprintf(
 		"postgres://%s:%s@%s:%d/%s?sslmode=%s",
